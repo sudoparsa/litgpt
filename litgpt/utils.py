@@ -1,57 +1,27 @@
 # Copyright Lightning AI. Licensed under the Apache License 2.0, see LICENSE file.
 
 """Utility functions for training and inference."""
-import inspect
+
 import math
-import os
 import pickle
-import re
-import shutil
 import sys
-from dataclasses import asdict, is_dataclass
 from io import BytesIO
-from packaging import version
 from pathlib import Path
-import subprocess
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Literal, Mapping, Optional, TypeVar, Union
-import warnings
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional, TypeVar, Union, Tuple
+from functools import partial
+import time
 
 import lightning as L
 import torch
 import torch.nn as nn
 import torch.utils._device
-import yaml
-from lightning.fabric.loggers import CSVLogger, TensorBoardLogger
-from lightning.fabric.strategies import FSDPStrategy
+from lightning.fabric.strategies import FSDPa
 from lightning.fabric.utilities.load import _lazy_load as lazy_load
-from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.cli import instantiate_class
 from torch.serialization import normalize_storage_type
 from typing_extensions import Self
 
-
 if TYPE_CHECKING:
-    from litgpt import GPT, Config
-
-
-def init_out_dir(out_dir: Path) -> Path:
-    if not out_dir.is_absolute() and "LIGHTNING_ARTIFACTS_DIR" in os.environ:
-        return Path(os.getenv("LIGHTNING_ARTIFACTS_DIR")) / out_dir
-    return out_dir
-
-
-def find_resume_path(resume: Union[bool, Literal["auto"], Path], out_dir: Path) -> Optional[Path]:
-    if not resume or isinstance(resume, Path):
-        return resume
-
-    resume_path = max(out_dir.rglob("step-*/*.pth"), key=(lambda p: int(p.parent.name.split("-")[1])), default=None)
-    if resume == "auto":
-        return resume_path
-    if resume is True and resume_path is None:
-        raise FileNotFoundError(
-            f"You passed `--resume=True`, but no checkpont file was found in `--out_dir={out_dir}`."
-        )
-    return resume_path
+    from lit_gpt import GPT
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -67,38 +37,20 @@ def num_parameters(module: nn.Module, requires_grad: Optional[bool] = None) -> i
         if requires_grad is None or p.requires_grad == requires_grad:
             if hasattr(p, "quant_state"):
                 # bitsandbytes 4bit layer support
-                total += math.prod(p.quant_state.shape)
+                total += math.prod(p.quant_state[1])
             else:
                 total += p.numel()
     return total
 
 
-def reset_parameters(module: nn.Module) -> None:
-    """Calls `reset_parameters` on the module and all its submodules."""
-    for mod in module.modules():
-        if callable(getattr(mod, "reset_parameters", None)):
-            mod.reset_parameters()
-
-
-def check_valid_checkpoint_dir(
-        checkpoint_dir: Path,
-        model_filename: str = "lit_model.pth",
-        verbose: bool = True,
-        raise_error: bool = False,
-        ignore_tokenizer_files: bool = False
-    ) -> None:
-
+def check_valid_checkpoint_dir(checkpoint_dir: Path) -> None:
     files = {
-        model_filename: (checkpoint_dir / model_filename).is_file(),
-        "model_config.yaml": (checkpoint_dir / "model_config.yaml").is_file(),
+        "lit_model.pth": (checkpoint_dir / "lit_model.pth").is_file(),
+        "lit_config.json": (checkpoint_dir / "lit_config.json").is_file(),
+        "tokenizer.json OR tokenizer.model": (checkpoint_dir / "tokenizer.json").is_file()
+        or (checkpoint_dir / "tokenizer.model").is_file(),
+        "tokenizer_config.json": (checkpoint_dir / "tokenizer_config.json").is_file(),
     }
-    if not ignore_tokenizer_files:
-        files.update({
-            "tokenizer.json OR tokenizer.model": (checkpoint_dir / "tokenizer.json").is_file() or
-                                                (checkpoint_dir / "tokenizer.model").is_file(),
-            "tokenizer_config.json": (checkpoint_dir / "tokenizer_config.json").is_file(),
-        })
-
     if checkpoint_dir.is_dir():
         if all(files.values()):
             # we're good
@@ -110,23 +62,18 @@ def check_valid_checkpoint_dir(
     # list locally available checkpoints
     available = list(Path("checkpoints").glob("*/*"))
     if available:
-        options = "\n".join([""] + [repr(str(p.resolve())) for p in available])
+        options = "\n --checkpoint_dir ".join([""] + [repr(str(p.resolve())) for p in available])
         extra = f"\nYou have downloaded locally:{options}\n"
     else:
         extra = ""
 
-    if verbose:
-        error_message = (
-            f"checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}."
-            "\nFind download instructions at https://github.com/Lightning-AI/litgpt/blob/main/tutorials\n"
-            f"{extra}\nSee all download options by running:\n litgpt download"
-        )
-        print(error_message, file=sys.stderr)
-
-    if raise_error:
-        raise FileNotFoundError(f"checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}.")
-    else:
-        raise SystemExit(1)
+    error_message = (
+        f"--checkpoint_dir {str(checkpoint_dir.absolute())!r}{problem}."
+        "\nFind download instructions at https://github.com/Lightning-AI/lit-gpt/blob/main/tutorials\n"
+        f"{extra}\nSee all download options by running:\n python scripts/download.py"
+    )
+    print(error_message, file=sys.stderr)
+    raise SystemExit(1)
 
 
 class SavingProxyForStorage:
@@ -270,14 +217,7 @@ class incremental_save:
         if storage.device.type != "cpu":
             storage = storage.cpu()
         num_bytes = storage.nbytes()
-
-        current_version = version.parse(torch.__version__)
-        threshold_version = version.parse("2.2.2")
-        if current_version <= threshold_version:
-            self.zipfile.write_record(name, storage.data_ptr(), num_bytes)
-        else:
-            self.zipfile.write_record(name, storage, num_bytes)
-
+        self.zipfile.write_record(name, storage.data_ptr(), num_bytes)
         return key
 
     def __exit__(self, type, value, traceback):
@@ -286,17 +226,139 @@ class incremental_save:
 
 T = TypeVar("T")
 
+global hash_table
+hash_table = None
+table_size = 1_000_003
+
+
+def _load_hash_table(device):
+    global hash_table
+    rng = torch.Generator(device=device)
+    rng.manual_seed(2971215073)  # fib47 is prime
+    hash_table = torch.rand(table_size, device=device, generator=rng)
+
+
+def apply_goldfish(
+    targets: torch.Tensor,
+    strategy: str,
+    k: int,
+    goldfish_start_position: int,
+    ignore_index,
+    goldfish_context_width: int = 4,  # context width for hash based drops
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply a mask to a tensor to ignore every k-th token.
+    `targets` is NOT updated in-place so apply_goldfish can be indepdently called for analysis/debugging/logging.
+
+    Args:
+        target: The target to apply the goldfish mask to.
+        strategy: The strategy to use for goldfish.
+            options implemented:
+                - "static": Ignore every k-th token starting from `goldfish_start_position`.
+                - "hash-legacy": Ignore tokens based on a hash of the context. For debugging purposes only.
+                - "hash-table": Ignore tokens based on a hash of the context using a precomputed table.
+                - "hash-avalanche": Ignore tokens based on a hash of the context using a hash function.
+        k: The frequency with which tokens are ignored?
+        goldfish_start_position: The position to start ignoring tokens from.
+        context_width: Context width for hash-based approaches.
+
+    Returns:
+        The target with the mask applied and the indices of the dropped tokens.
+    """
+    device = targets.device
+    mbs, block_size = targets.shape
+    masked_targets = targets.clone()
+
+    if strategy == "static":
+        dropped_token_indices = torch.arange(block_size, device=device)[goldfish_start_position::k].long()
+        masked_targets[:, dropped_token_indices] = ignore_index
+    elif strategy == "seeded_random":
+        random_tensor = torch.randint(1, k + 1, size=targets.size())
+        dropped_token_indices = (random_tensor == k).int() # probability of dropping a token is 1/k
+        masked_targets[dropped_token_indices] = ignore_index
+    elif strategy == "hash-legacy":
+        # Old hash for sanity checks, do not use
+        dropped_token_indices = torch.zeros_like(targets)
+        rng = torch.Generator(device=device)
+        for b in range(mbs):
+            for s in range(goldfish_context_width, block_size):
+                prf_key = targets[b, s - goldfish_context_width : s].prod()
+                rng.manual_seed(prf_key.item() % (2**64 - 1))
+                dropped_token_indices[b, s] = torch.rand((1,), device=device) < 1 / k
+        masked_targets[dropped_token_indices] = ignore_index
+    elif strategy == "hash-table":
+        global hash_table
+        if hash_table is None:
+            _load_hash_table(device)
+        hashed_keys = hash_table[targets.unfold(1, goldfish_context_width, 1).prod(dim=-1) % table_size]
+        dropped_token_indices = (hashed_keys < 1 / k)
+        masked_targets[:, goldfish_context_width-1:][dropped_token_indices] = ignore_index
+        dropped_token_indices = dropped_token_indices.int()
+    elif strategy == "hash-avalanche":
+        keys = targets.unfold(1, goldfish_context_width, 1).prod(dim=-1).to(dtype=torch.uint64)
+        hashed_keys = hashint(keys, width=32).long()
+        dropped_token_indices = hashed_keys < ((1 << 32) - 1) / k
+        masked_targets[:, goldfish_context_width-1:][dropped_token_indices] = ignore_index
+    else:
+        raise NotImplementedError(f"{strategy} goldfish strategy is not implemented. Try 'static' instead.")
+
+    return masked_targets, dropped_token_indices
+
+
+@torch.compile  # required for uint64 support
+def hashint(key: torch.Tensor, width: int = 32):
+    """
+    For any 1<k<=64, let mask=(1<<k)-1. hash_64() is a bijection on [0,1<<k), which means
+    hash_64(x, mask)==hash_64(y, mask) if and only if x==y. hash_64i() is the inversion of
+    hash_64(): hash_64i(hash_64(x, mask), mask) == hash_64(hash_64i(x, mask), mask) == x.
+    """
+    # thomas wang 64bit
+    mask = (1 << width) - 1
+    key = (~key + (key << 21)) & mask
+    key = (key << 21) - key - 1
+    key = key ^ key >> 24
+    key = ((key + (key << 3)) + (key << 8)) & mask
+    key = key * 265
+    key = key ^ key >> 14
+    key = ((key + (key << 2)) + (key << 4)) & mask
+    key = key * 21
+    key = key ^ key >> 28
+    key = (key + (key << 31)) & mask
+    return key
+
 
 def chunked_cross_entropy(
     logits: Union[torch.Tensor, List[torch.Tensor]],
     targets: torch.Tensor,
     chunk_size: int = 128,
-    ignore_index: int = -100,
+    ignore_index: int = -1,
+    label_smoothing: float = 0.0,
+    goldfish_strategy: Union[str, None] = None,
+    k_goldfish: Union[None, int] = None,
+    goldfish_start_position: int = 0,
+    goldfish_context_width: int = 4,
+    
+    reduction: str = None,
 ) -> torch.Tensor:
     # with large max_sequence_lengths, the beginning of `backward` allocates a large memory chunk which can dominate
     # the memory usage in fine-tuning settings with low number of parameters.
     # as a workaround hack, the cross entropy computation is chunked to force it to deallocate on the go, reducing
     # the memory spike's magnitude
+
+    # ignore every k-th token using ignore_index for Token Loss Dropout (goldfish)
+    if goldfish_strategy is not None:
+        # targets get overwritten and not updated in-place
+        targets, _ = apply_goldfish(
+                        targets, 
+                        goldfish_strategy, 
+                        k_goldfish, 
+                        goldfish_start_position, 
+                        ignore_index,
+                        goldfish_context_width
+                        )
+
+    cross_entropy_fn = partial(
+        torch.nn.functional.cross_entropy, ignore_index=ignore_index, label_smoothing=label_smoothing
+    )
 
     # lm_head was chunked (we are fine-tuning)
     if isinstance(logits, list):
@@ -305,38 +367,39 @@ def chunked_cross_entropy(
             logits = torch.cat(logits, dim=1)
             logits = logits.reshape(-1, logits.size(-1))
             targets = targets.reshape(-1)
-            return torch.nn.functional.cross_entropy(logits, targets, ignore_index=ignore_index)
+            if reduction is not None:
+                return cross_entropy_fn(input=logits, target=targets, reduction=reduction)
+            else:
+                return cross_entropy_fn(input=logits, target=targets)
 
         # chunk cross entropy
         logit_chunks = [logit_chunk.reshape(-1, logit_chunk.size(-1)) for logit_chunk in logits]
         target_chunks = [target_chunk.reshape(-1) for target_chunk in targets.split(logits[0].size(1), dim=1)]
         loss_chunks = [
-            torch.nn.functional.cross_entropy(logit_chunk, target_chunk, ignore_index=ignore_index, reduction="none")
+            cross_entropy_fn(input=logit_chunk, target=target_chunk, reduction="none")
             for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
         ]
         non_masked_elems = (targets != ignore_index).sum()
-        # See [non_masked_elems div note]
-        return torch.cat(loss_chunks).sum() / non_masked_elems.maximum(torch.ones_like(non_masked_elems))
+        return torch.cat(loss_chunks).sum() / max(1, non_masked_elems)
 
     # no chunking at all
     logits = logits.reshape(-1, logits.size(-1))
     targets = targets.reshape(-1)
     if chunk_size == 0:
-        return torch.nn.functional.cross_entropy(logits, targets, ignore_index=ignore_index)
+        if reduction is not None:
+            return cross_entropy_fn(input=logits, target=targets, reduction=reduction)
+        else:
+            return cross_entropy_fn(input=logits, target=targets)
 
     # lm_head wasn't chunked, chunk cross entropy
     logit_chunks = logits.split(chunk_size)
     target_chunks = targets.split(chunk_size)
     loss_chunks = [
-        torch.nn.functional.cross_entropy(logit_chunk, target_chunk, ignore_index=ignore_index, reduction="none")
+        cross_entropy_fn(input=logit_chunk, target=target_chunk, reduction="none")
         for logit_chunk, target_chunk in zip(logit_chunks, target_chunks)
     ]
     non_masked_elems = (targets != ignore_index).sum()
-    # [non_masked_elems div note]:
-    #   max(1, non_masked_elems) would be more ergonomic to avoid a division by zero. However that
-    #   results in a python int which is then passed back to torch division. By using the
-    #   `x.maximum(torch.ones_like(x))` pattern we avoid a cudaStreamSynchronize.
-    return torch.cat(loss_chunks).sum() / non_masked_elems.maximum(torch.ones_like(non_masked_elems))
+    return torch.cat(loss_chunks).sum() / max(1, non_masked_elems)
 
 
 def map_old_state_dict_weights(state_dict: Dict, mapping: Mapping, prefix: str) -> Dict:
@@ -349,29 +412,28 @@ def map_old_state_dict_weights(state_dict: Dict, mapping: Mapping, prefix: str) 
 
 
 def get_default_supported_precision(training: bool) -> str:
-    """
-    Return the default precision that is supported by the hardware: either `bf16` or `16`.
+    """Return default precision that is supported by the hardware: either `bf16` or `16`.
 
     Args:
-        training: If True, returns '-mixed' version of the precision; if False, returns '-true' version.
-        use_mps: Flag to determine if MPS should be used when available.
+        training: `-mixed` or `-true` version of the precision to use
 
     Returns:
-        The default precision that is suitable for the task and is supported by the hardware.
+        default precision that is suitable for the task and is supported by the hardware
     """
-    import torch
+    from lightning.fabric.accelerators import MPSAccelerator
 
-    if torch.cuda.is_available():
-        if torch.cuda.is_bf16_supported():
-            return "bf16-mixed" if training else "bf16-true"
-        else:
-            return "16-mixed" if training else "16-true"
+    if MPSAccelerator.is_available() or (torch.cuda.is_available() and not torch.cuda.is_bf16_supported()):
+        return "16-mixed" if training else "16-true"
     return "bf16-mixed" if training else "bf16-true"
 
 
 def load_checkpoint(fabric: L.Fabric, model: nn.Module, checkpoint_path: Path, strict: bool = True) -> None:
     if isinstance(fabric.strategy, FSDPStrategy):
         fabric.load_raw(checkpoint_path, model, strict=strict)
+    elif fabric.strategy == "AxoNNFabric":
+        state_dict = lazy_load(checkpoint_path)
+        state_dict = state_dict.get("model", state_dict)
+        fabric.unwrapped_model.load_state_dict(state_dict, strict=strict)
     else:
         state_dict = lazy_load(checkpoint_path)
         state_dict = state_dict.get("model", state_dict)
@@ -442,212 +504,10 @@ class CycleIterator:
         return self
 
 
-def copy_config_files(source_dir: Path, out_dir: Path) -> None:
-    """Copies the specified configuration and tokenizer files into the output directory."""
-
-    config_files = ["config.json", "generation_config.json", "model_config.yaml"]
-    tokenizer_files = ["tokenizer.json", "tokenizer.model", "tokenizer_config.json"]
-
-    for file_name in config_files + tokenizer_files:
-        src_path = source_dir / file_name
-        if src_path.exists():
-            shutil.copy(src_path, out_dir)
-
-
 def CLI(*args: Any, **kwargs: Any) -> Any:
-    from jsonargparse import CLI, set_config_read_mode, set_docstring_parse_options
+    from jsonargparse import CLI, set_docstring_parse_options
 
     set_docstring_parse_options(attribute_docstrings=True)
-    set_config_read_mode(urls_enabled=True)
 
+    kwargs.setdefault("as_positional", False)
     return CLI(*args, **kwargs)
-
-
-def capture_hparams() -> Dict[str, Any]:
-    """Captures the local variables ('hyperparameters') from where this function gets called."""
-    caller_frame = inspect.currentframe().f_back
-    locals_of_caller = caller_frame.f_locals
-    hparams = {}
-    for name, value in locals_of_caller.items():
-        if value is None or isinstance(value, (int, float, str, bool, Path)):
-            hparams[name] = value
-        elif is_dataclass(value):
-            hparams[name] = asdict(value)
-        else:
-            hparams[name] = str(value)
-    return hparams
-
-
-def save_hyperparameters(function: callable, checkpoint_dir: Path) -> None:
-    """Captures the CLI parameters passed to `function` without running `function` and saves them to the checkpoint."""
-    from jsonargparse import capture_parser
-
-    # TODO: Make this more robust
-    # This hack strips away the subcommands from the top-level CLI
-    # to parse the file as if it was called as a script
-    known_commands = [
-        ("finetune_full",),  # For subcommands, use `("finetune", "full")` etc
-        ("finetune_lora",),
-        ("finetune_adapter",),
-        ("finetune_adapter_v2",),
-        ("finetune",),
-        ("pretrain",),
-    ]
-    for known_command in known_commands:
-        unwanted = slice(1, 1 + len(known_command))
-        if tuple(sys.argv[unwanted]) == known_command:
-            sys.argv[unwanted] = []
-
-    parser = capture_parser(lambda: CLI(function))
-    config = parser.parse_args()
-    parser.save(config, checkpoint_dir / "hyperparameters.yaml", overwrite=True)
-
-
-def save_config(config: "Config", checkpoint_dir: Path) -> None:
-    config_dict = asdict(config)
-    with open(checkpoint_dir / "model_config.yaml", "w", encoding="utf-8") as fp:
-        yaml.dump(config_dict, fp)
-
-
-def parse_devices(devices: Union[str, int]) -> int:
-    if devices in (-1, "auto"):
-        return torch.cuda.device_count() or 1
-    if isinstance(devices, int) and devices > 0:
-        return devices
-    raise ValueError(f"Devices must be 'auto' or a positive integer, got: {devices!r}")
-
-
-def choose_logger(
-    logger_name: Literal["csv", "tensorboard", "wandb"],
-    out_dir: Path,
-    name: str,
-    log_interval: int = 1,
-    resume: Optional[bool] = None,
-    **kwargs: Any,
-):
-    if logger_name == "csv":
-        return CSVLogger(root_dir=(out_dir / "logs"), name="csv", flush_logs_every_n_steps=log_interval, **kwargs)
-    if logger_name == "tensorboard":
-        return TensorBoardLogger(root_dir=(out_dir / "logs"), name="tensorboard", **kwargs)
-    if logger_name == "wandb":
-        return WandbLogger(project=name, resume=resume, **kwargs)
-    raise ValueError(f"`--logger_name={logger_name}` is not a valid option. Choose from 'csv', 'tensorboard', 'wandb'.")
-
-
-def get_argument_names(cls):
-    sig = inspect.signature(cls.__init__)
-    return {name for name, param in sig.parameters.items()
-            if param.kind in [inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY]}
-
-
-def instantiate_bnb_optimizer(optimizer, model_parameters):
-    if (isinstance(optimizer, str) and "AdamW" not in optimizer) or (isinstance(optimizer, dict) and "AdamW" not in optimizer.get("class_path", "")):
-        raise ValueError("The chosen quantization format only supports the AdamW optimizer.")
-
-    import bitsandbytes as bnb
-    if isinstance(optimizer, str):
-        optimizer = bnb.optim.PagedAdamW(model_parameters)
-    else:
-        optim_args = get_argument_names(bnb.optim.PagedAdamW)
-        allowed_kwargs = {key: optimizer["init_args"][key] for key in optim_args & optimizer["init_args"].keys()}
-        optimizer = bnb.optim.PagedAdamW(model_parameters, **allowed_kwargs)
-    return optimizer
-
-
-def instantiate_torch_optimizer(optimizer, model_parameters, **kwargs):
-    if isinstance(optimizer, str):
-        optimizer_cls = getattr(torch.optim, optimizer)
-        optimizer = optimizer_cls(model_parameters, **kwargs)
-    else:
-        optimizer = dict(optimizer)  # copy
-        optimizer["init_args"].update(kwargs)
-        optimizer = instantiate_class(model_parameters, optimizer)
-    return optimizer
-
-
-def extend_checkpoint_dir(checkpoint_dir: Path) -> Path:
-    new_checkpoint_dir = "checkpoints" / checkpoint_dir
-    should_return_new_dir = (not checkpoint_dir.is_dir() and
-                             checkpoint_dir.parts[0] != "checkpoints" and
-                             not checkpoint_dir.is_absolute() and
-                             new_checkpoint_dir.exists())
-    return new_checkpoint_dir if should_return_new_dir else checkpoint_dir
-
-
-def check_file_size_on_cpu_and_warn(checkpoint_path, device, size_limit=4_509_715_660):
-    """
-    Checks the file size and raises a warning if it exceeds the size_limit.
-    The default size limit is 4.2 GB, the size of TinyLlama 1.1B: 4.2 * 1024 * 1024 * 1024 = 4_509_715_660
-    """
-    size = 0.0
-    if os.path.exists(checkpoint_path):
-        size = os.path.getsize(checkpoint_path)
-        if size > size_limit and str(device) == "cpu":
-            warnings.warn(
-                f"The file size of {checkpoint_path} is over {size_limit/1024/1024/1024:.1f} GB. Using a model "
-                "with more than 1B parameters on a CPU can be slow, it is recommended to switch to a GPU."
-            )
-    return size
-
-
-def auto_download_checkpoint(model_name, access_token=None, ignore_tokenizer_files=False):
-    from litgpt.scripts.download import download_from_hub  # moved here due to circular import issue
-
-    checkpoint_dir = extend_checkpoint_dir(Path(model_name))
-    try:
-        check_valid_checkpoint_dir(checkpoint_dir, verbose=False, raise_error=True, ignore_tokenizer_files=ignore_tokenizer_files)
-    except FileNotFoundError as e:
-        if access_token is None:
-            access_token = os.getenv("HF_TOKEN")
-
-        if checkpoint_dir.parts[0] != "checkpoints" and not checkpoint_dir.is_absolute():
-            download_from_hub(repo_id=str(model_name), access_token=access_token)
-            checkpoint_dir = Path("checkpoints") / checkpoint_dir
-        else:
-            raise e
-
-    return checkpoint_dir
-
-
-def check_nvlink_connectivity(fabric=None):
-    if fabric is not None:
-        custom_print = fabric.print
-    else:
-        custom_print = print
-    if os.getenv("RANK", "0") == "0":
-        try:
-            result = subprocess.run(["nvidia-smi", "topo", "-m"], stdout=subprocess.PIPE, text=True)
-
-            if result.returncode != 0:
-                custom_print("Failed to run nvidia-smi")
-                return
-
-            lines = result.stdout.split('\n')
-            gpu_matrix = []
-
-            start_index = next((i for i, line in enumerate(lines) if "GPU0" in line), None) + 1
-            headers_line = lines[start_index - 1]
-            headers = headers_line.split()
-            # The regex is to avoid counting the "GPU NUMA ID" header as a GPU
-            # in headers like ['\x1b[4mGPU0', 'GPU1', 'GPU2', 'GPU3', 'GPU4', 'GPU5', 'GPU6', 'GPU7', 'NIC0', 'NIC1', 'NIC2', 'NIC3', 'NIC4', 'NIC5', 'NIC6', 'NIC7', 'NIC8', 'NIC9', 'CPU', 'Affinity', 'NUMA', 'Affinity', 'GPU', 'NUMA', 'ID\x1b[0m']
-            gpu_regex = re.compile(r'^GPU\d+$')
-            gpu_count = len([header for header in headers if gpu_regex.match(header)])
-
-            all_nvlink = True
-            for line in lines[start_index:start_index + gpu_count]:
-                gpu_matrix.append(line.strip())
-                connections = line.split()[1:1 + gpu_count]
-                if not all("NV" in conn for conn in connections if conn != "X"):
-                    all_nvlink = False
-                    break
-
-            if all_nvlink:
-                custom_print("All GPUs are fully connected via NVLink.")
-            else:
-                custom_print(
-                    "Warning: Not all GPUs are fully connected via NVLink. Some GPUs are connected via slower interfaces. "
-                    "It is recommended to switch to a different machine with faster GPU connections for optimal multi-GPU training performance."
-                )
-
-        except Exception as e:
-            custom_print(f"An error occurred: {e}")
