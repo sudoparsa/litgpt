@@ -37,23 +37,23 @@ sys.path = [str(wd)] + sys.path
 
 from axonn_fabric.fabric import AxoNNFabric
 
-from lit_gpt.model import Block, CausalSelfAttention, LLaMAMLP
-from lit_gpt.model import GPT, Config
-from lit_gpt.model_axonn import GPT as GPT_axonn
-from lit_gpt.model_axonn import Config as Config_axonn
+from litgpt.model import Block, CausalSelfAttention, LLaMAMLP
+from litgpt.model import GPT, Config
+from litgpt.model_axonn import GPT as GPT_axonn
+from litgpt.model_axonn import Config as Config_axonn
 
-from lit_gpt.tokenizer import Tokenizer
-from lit_gpt.packed_cycle_dataset import CombinedDataset, PackedDataset
-from lit_gpt.huggingface_dataset import HuggingfaceDataset
-from lit_gpt.data_loading_utils import generic_collate_fn
-from lit_gpt.utils import (
+from litgpt.tokenizer import Tokenizer
+from litgpt.packed_cycle_dataset import CombinedDataset, PackedDataset
+from litgpt.huggingface_dataset import HuggingfaceDataset
+from litgpt.data_loading_utils import generic_collate_fn
+from litgpt.utils import (
     chunked_cross_entropy,
     apply_goldfish,
     num_parameters,
     check_valid_checkpoint_dir,
     load_checkpoint,
 )
-from lit_gpt.data_scheduler_utils import DataSchedulerTracker, DataScheduler
+from litgpt.data_scheduler_utils import DataSchedulerTracker, DataScheduler
 
 
 import logging
